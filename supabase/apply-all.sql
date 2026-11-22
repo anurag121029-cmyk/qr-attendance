@@ -2,10 +2,11 @@
 -- SQL editor of a NEW project created for this app. Do not run it in
 -- another project's database. (Single inlined copy of migrations/0001_initial.sql
 -- because the SQL editor does not run \i includes.)
-
--- QR Attendance System — migration 0001
--- Tables: profiles, classes, subjects, class_enrollments, sessions,
--- attendance_records. Run via supabase/apply-all.sql in the SQL editor.
+--
+-- NOTE: all tables are created first, then all RLS policies afterwards.
+-- Policies reference other tables (e.g. classes policies read
+-- class_enrollments), so creating a policy before its referenced table
+-- exists fails with "relation does not exist" and rolls the whole run back.
 
 -- ---------- profiles (one row per auth user) ----------
 create table if not exists public.profiles (
@@ -17,14 +18,6 @@ create table if not exists public.profiles (
   created_at timestamptz not null default now()
 );
 alter table public.profiles enable row level security;
-
--- A user can read their own profile; admins can read all.
-create policy "profiles: own read" on public.profiles
-  for select using (auth.uid() = id);
-create policy "profiles: admin read all" on public.profiles
-  for select using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
-create policy "profiles: own update" on public.profiles
-  for update using (auth.uid() = id) with check (auth.uid() = id);
 
 -- New sign-ups get a profile. Role comes from the signup form metadata
 -- (student/teacher); an admin promotes accounts to admin with SQL.
@@ -59,17 +52,6 @@ create table if not exists public.classes (
 );
 alter table public.classes enable row level security;
 
-create policy "classes: teacher own" on public.classes
-  for all using (teacher_id = auth.uid())
-  with check (teacher_id = auth.uid());
-create policy "classes: admin all" on public.classes
-  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
-create policy "classes: enrolled student read" on public.classes
-  for select using (exists (
-    select 1 from public.class_enrollments e
-    where e.class_id = classes.id and e.student_id = auth.uid()
-  ));
-
 -- ---------- subjects ----------
 create table if not exists public.subjects (
   id uuid primary key default gen_random_uuid(),
@@ -80,21 +62,6 @@ create table if not exists public.subjects (
 );
 alter table public.subjects enable row level security;
 
-create policy "subjects: class teacher" on public.subjects
-  for all using (exists (
-    select 1 from public.classes c where c.id = subjects.class_id and c.teacher_id = auth.uid()
-  ))
-  with check (exists (
-    select 1 from public.classes c where c.id = subjects.class_id and c.teacher_id = auth.uid()
-  ));
-create policy "subjects: admin all" on public.subjects
-  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
-create policy "subjects: enrolled student read" on public.subjects
-  for select using (exists (
-    select 1 from public.class_enrollments e
-    where e.class_id = subjects.class_id and e.student_id = auth.uid()
-  ));
-
 -- ---------- class enrollments ----------
 create table if not exists public.class_enrollments (
   id uuid primary key default gen_random_uuid(),
@@ -104,17 +71,6 @@ create table if not exists public.class_enrollments (
   unique (class_id, student_id)
 );
 alter table public.class_enrollments enable row level security;
-
-create policy "enrollments: student own" on public.class_enrollments
-  for select using (student_id = auth.uid());
-create policy "enrollments: student join" on public.class_enrollments
-  for insert with check (student_id = auth.uid());
-create policy "enrollments: teacher read own classes" on public.class_enrollments
-  for select using (exists (
-    select 1 from public.classes c where c.id = class_enrollments.class_id and c.teacher_id = auth.uid()
-  ));
-create policy "enrollments: admin all" on public.class_enrollments
-  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
 
 -- ---------- sessions ----------
 -- qr_secret is the per-session secret behind the rotating QR code. It is
@@ -136,18 +92,6 @@ create table if not exists public.sessions (
 );
 alter table public.sessions enable row level security;
 
-create policy "sessions: teacher own" on public.sessions
-  for all using (teacher_id = auth.uid())
-  with check (teacher_id = auth.uid());
-create policy "sessions: admin all" on public.sessions
-  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
--- Students see sessions of classes they are enrolled in, but NOT qr_secret.
-create policy "sessions: enrolled student read" on public.sessions
-  for select using (exists (
-    select 1 from public.class_enrollments e
-    where e.class_id = sessions.class_id and e.student_id = auth.uid()
-  ));
-
 -- ---------- attendance records ----------
 create table if not exists public.attendance_records (
   id uuid primary key default gen_random_uuid(),
@@ -165,6 +109,70 @@ create table if not exists public.attendance_records (
 );
 alter table public.attendance_records enable row level security;
 
+-- ---------- RLS policies (all tables now exist) ----------
+
+-- profiles: a user can read their own profile; admins can read all.
+create policy "profiles: own read" on public.profiles
+  for select using (auth.uid() = id);
+create policy "profiles: admin read all" on public.profiles
+  for select using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+create policy "profiles: own update" on public.profiles
+  for update using (auth.uid() = id) with check (auth.uid() = id);
+
+-- classes
+create policy "classes: teacher own" on public.classes
+  for all using (teacher_id = auth.uid())
+  with check (teacher_id = auth.uid());
+create policy "classes: admin all" on public.classes
+  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+create policy "classes: enrolled student read" on public.classes
+  for select using (exists (
+    select 1 from public.class_enrollments e
+    where e.class_id = classes.id and e.student_id = auth.uid()
+  ));
+
+-- subjects
+create policy "subjects: class teacher" on public.subjects
+  for all using (exists (
+    select 1 from public.classes c where c.id = subjects.class_id and c.teacher_id = auth.uid()
+  ))
+  with check (exists (
+    select 1 from public.classes c where c.id = subjects.class_id and c.teacher_id = auth.uid()
+  ));
+create policy "subjects: admin all" on public.subjects
+  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+create policy "subjects: enrolled student read" on public.subjects
+  for select using (exists (
+    select 1 from public.class_enrollments e
+    where e.class_id = subjects.class_id and e.student_id = auth.uid()
+  ));
+
+-- class enrollments
+create policy "enrollments: student own" on public.class_enrollments
+  for select using (student_id = auth.uid());
+create policy "enrollments: student join" on public.class_enrollments
+  for insert with check (student_id = auth.uid());
+create policy "enrollments: teacher read own classes" on public.class_enrollments
+  for select using (exists (
+    select 1 from public.classes c where c.id = class_enrollments.class_id and c.teacher_id = auth.uid()
+  ));
+create policy "enrollments: admin all" on public.class_enrollments
+  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+
+-- sessions
+create policy "sessions: teacher own" on public.sessions
+  for all using (teacher_id = auth.uid())
+  with check (teacher_id = auth.uid());
+create policy "sessions: admin all" on public.sessions
+  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+-- Students see sessions of classes they are enrolled in, but NOT qr_secret.
+create policy "sessions: enrolled student read" on public.sessions
+  for select using (exists (
+    select 1 from public.class_enrollments e
+    where e.class_id = sessions.class_id and e.student_id = auth.uid()
+  ));
+
+-- attendance records
 create policy "attendance: student own read" on public.attendance_records
   for select using (student_id = auth.uid());
 create policy "attendance: teacher read own sessions" on public.attendance_records
